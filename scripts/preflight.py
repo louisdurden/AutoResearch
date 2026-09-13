@@ -460,9 +460,51 @@ def probe_tool_use_ordering(profile: dict[str, Any]) -> ProbeResult:
     return ProbeResult(OK, "both assistant content layouts accepted", elapsed, stage="request")
 
 
+def probe_codex_cli(profile: dict[str, Any]) -> ProbeResult:
+    """Local patch (Hamuy, 2026-09-12): same body as the HTTP probes -- dispatch_profile
+    already routes 'codex_cli_subprocess' to providers.DIALECTS[...] correctly (see
+    src/providers.py); this only had to be added here too because PROBES is preflight's
+    own allowlist, separate from providers.DIALECTS."""
+    reply = providers.dispatch_profile(
+        profile,
+        alias=str(resolve(profile, "model") or ""),
+        timeout=request_timeout(),
+        contract=proxy_contract_of(profile),
+        max_tokens=PROBE_MAX_TOKENS,
+    )
+    return _as_probe_result(reply, profile)
+
+
+def probe_claude_cli(profile: dict[str, Any]) -> ProbeResult:
+    """Same reasoning as probe_codex_cli, for the Claude Code CLI subscription."""
+    reply = providers.dispatch_profile(
+        profile,
+        alias=str(resolve(profile, "model") or ""),
+        timeout=request_timeout(),
+        contract=proxy_contract_of(profile),
+        max_tokens=PROBE_MAX_TOKENS,
+    )
+    return _as_probe_result(reply, profile)
+
+
+def probe_agy_cli(profile: dict[str, Any]) -> ProbeResult:
+    """Same reasoning as probe_codex_cli, for the Antigravity CLI (Google AI Pro)."""
+    reply = providers.dispatch_profile(
+        profile,
+        alias=str(resolve(profile, "model") or ""),
+        timeout=request_timeout(),
+        contract=proxy_contract_of(profile),
+        max_tokens=PROBE_MAX_TOKENS,
+    )
+    return _as_probe_result(reply, profile)
+
+
 PROBES = {
     "openai_chat": probe_openai_chat,
     "anthropic_messages": probe_anthropic_messages,
+    "codex_cli_subprocess": probe_codex_cli,
+    "claude_cli_subprocess": probe_claude_cli,
+    "agy_cli_subprocess": probe_agy_cli,
 }
 
 
@@ -488,6 +530,21 @@ def evaluate(
             FAIL,
             f"this role requires api={' or '.join(allowed)} but the profile is {api}",
             stage="config",
+        )
+
+    # Local patch (Hamuy, 2026-09-12): allowed == ["anthropic_messages"] only happens
+    # for the "agent" role (see config/providers.local.json roles.agent._requires_api).
+    # That role is never HTTP-probed for real -- render_env.py projects its model into
+    # ar-runtime/.claude/settings.local.json and the actual consumer is Claude Code CLI,
+    # authenticated via whatever session is already logged in (subscription OAuth, no
+    # API key ever set on purpose). Opt-in only, so a real Anthropic API key still wins
+    # normal preflight semantics for anyone who sets one.
+    if (allowed == ["anthropic_messages"]
+            and os.environ.get("AUTORESEARCH_AGENT_SUBSCRIPTION") == "1"):
+        return ProbeResult(
+            OK,
+            f"{profile_name} projected to ar-runtime/.claude/settings.local.json; "
+            "auth is the logged-in Claude Code subscription, not an API key",
         )
 
     # 「配没配」问 providers，投影问的是同一个函数。这里原来自己判一遍凭据、再自己判

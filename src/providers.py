@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+import subprocess
+
 import httpx
 
 import api_retry
@@ -278,12 +280,201 @@ DIALECTS: dict[str, Dialect] = {
 }
 
 
+# Local patch (Hamuy, 2026-09-12): a dialect that shells out to `codex exec` instead
+# of making an HTTP call, so a role can use the Codex CLI subscription (ChatGPT/Codex
+# plan, no API key) as a genuinely distinct, independent model identity alongside
+# local Qwen and Gemini -- no new paid API key. Same "no HTTP for this role" idea as
+# the anthropic-subscription patch on usable_candidates()/preflight, but this dialect
+# actually gets called mid-pipeline (judge/planner/ideator etc. read its Reply.text
+# synchronously), so it has to speak Wire/Reply like every other dialect instead of
+# just being a config projection nobody calls.
+CODEX_CLI_SUBPROCESS = "codex_cli_subprocess"
+
+
+class CodexCliSubprocess:
+    """Wire carries the prompt/model in `body`; there is no real HTTP request."""
+
+    name = CODEX_CLI_SUBPROCESS
+
+    def build(self, endpoint: dict[str, Any], model: str, prompt: str,
+              params: dict[str, Any]) -> Wire:
+        return Wire(method="CODEX", url="codex-cli://exec", headers={},
+                    body={"prompt": prompt, "model": model},
+                    timeout=params.get("timeout", DEFAULT_MODEL_TIMEOUT))
+
+    def read(self, response: httpx.Response, elapsed: float) -> Reply:
+        raise NotImplementedError(
+            "codex_cli_subprocess never produces an httpx.Response; "
+            "send() routes it to _send_codex_subprocess instead")
+
+
+DIALECTS[CODEX_CLI_SUBPROCESS] = CodexCliSubprocess()
+
+# Same pattern, second subscription: Claude Code CLI, already logged in on this
+# machine (the same session used for the "agent" role, but here dispatched per-call
+# instead of projected into a config file -- this identity IS reachable mid-pipeline).
+CLAUDE_CLI_SUBPROCESS = "claude_cli_subprocess"
+
+
+class ClaudeCliSubprocess:
+    name = CLAUDE_CLI_SUBPROCESS
+
+    def build(self, endpoint: dict[str, Any], model: str, prompt: str,
+              params: dict[str, Any]) -> Wire:
+        return Wire(method="CLAUDE", url="claude-cli://exec", headers={},
+                    body={"prompt": prompt, "model": model},
+                    timeout=params.get("timeout", DEFAULT_MODEL_TIMEOUT))
+
+    def read(self, response: httpx.Response, elapsed: float) -> Reply:
+        raise NotImplementedError(
+            "claude_cli_subprocess never produces an httpx.Response; "
+            "send() routes it to _send_claude_subprocess instead")
+
+
+DIALECTS[CLAUDE_CLI_SUBPROCESS] = ClaudeCliSubprocess()
+
+# Third subscription: Antigravity CLI (`agy`), runs on Google AI Pro (no API key).
+# CAVEAT (see ~/.claude/tool-catalog.md and memory/alfred-hermes-model-chain-2026-09-01.md):
+# Antigravity has a WEEKLY quota cap that locks the account for days if exhausted, and
+# per-call token usage runs far higher than local/Codex/Claude for comparable tasks
+# (~243k tokens seen for one maintenance task vs ~855 tokens locally) -- use as one
+# candidate among several, never as a role's sole provider.
+AGY_CLI_SUBPROCESS = "agy_cli_subprocess"
+
+
+class AgyCliSubprocess:
+    name = AGY_CLI_SUBPROCESS
+
+    def build(self, endpoint: dict[str, Any], model: str, prompt: str,
+              params: dict[str, Any]) -> Wire:
+        return Wire(method="AGY", url="agy-cli://exec", headers={},
+                    body={"prompt": prompt, "model": model},
+                    timeout=params.get("timeout", DEFAULT_MODEL_TIMEOUT))
+
+    def read(self, response: httpx.Response, elapsed: float) -> Reply:
+        raise NotImplementedError(
+            "agy_cli_subprocess never produces an httpx.Response; "
+            "send() routes it to _send_agy_subprocess instead")
+
+
+DIALECTS[AGY_CLI_SUBPROCESS] = AgyCliSubprocess()
+
+
+def _send_agy_subprocess(wire: Wire) -> Reply:
+    """`agy -p <prompt> --dangerously-skip-permissions [--model <model>]`."""
+    started = time.time()
+    prompt = wire.body.get("prompt", "")
+    model = wire.body.get("model") or None
+    cmd = ["agy", "-p", prompt, "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=wire.timeout)
+    except subprocess.TimeoutExpired:
+        return Reply(UNREACHABLE, stage="transport", detail="agy -p timed out",
+                     elapsed=time.time() - started)
+    except FileNotFoundError:
+        return Reply(UNCONFIGURED, stage="config", detail="agy CLI not on PATH",
+                     elapsed=time.time() - started)
+    except Exception as exc:
+        return Reply(UNREACHABLE, stage="transport",
+                     detail=f"{type(exc).__name__}: {exc}"[:200],
+                     elapsed=time.time() - started)
+    elapsed = time.time() - started
+    if proc.returncode != 0:
+        return Reply(REMOTE_ERROR, stage="request", detail=(proc.stderr or "")[:200],
+                     elapsed=elapsed)
+    text = proc.stdout.strip()
+    if not text:
+        return Reply(EMPTY, stage="request", detail="agy -p returned no text",
+                     elapsed=elapsed)
+    return Reply(DELIVERED, text=text, elapsed=elapsed)
+
+
+def _send_claude_subprocess(wire: Wire) -> Reply:
+    """`claude -p <prompt> --model <model>`, no --dangerously-skip-permissions here --
+    this is a plain text-generation probe/role call, not a tool-using agent loop."""
+    started = time.time()
+    prompt = wire.body.get("prompt", "")
+    model = wire.body.get("model") or None
+    cmd = ["claude", "-p", prompt]
+    if model:
+        cmd += ["--model", model]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=wire.timeout)
+    except subprocess.TimeoutExpired:
+        return Reply(UNREACHABLE, stage="transport", detail="claude -p timed out",
+                     elapsed=time.time() - started)
+    except FileNotFoundError:
+        return Reply(UNCONFIGURED, stage="config", detail="claude CLI not on PATH",
+                     elapsed=time.time() - started)
+    except Exception as exc:
+        return Reply(UNREACHABLE, stage="transport",
+                     detail=f"{type(exc).__name__}: {exc}"[:200],
+                     elapsed=time.time() - started)
+    elapsed = time.time() - started
+    if proc.returncode != 0:
+        return Reply(REMOTE_ERROR, stage="request", detail=(proc.stderr or "")[:200],
+                     elapsed=elapsed)
+    text = proc.stdout.strip()
+    if not text:
+        return Reply(EMPTY, stage="request", detail="claude -p returned no text",
+                     elapsed=elapsed)
+    return Reply(DELIVERED, text=text, elapsed=elapsed)
+
+
+def _send_codex_subprocess(wire: Wire) -> Reply:
+    """Run `codex exec` as a subprocess and translate its outcome into a Reply.
+
+    Reuses the same outcome vocabulary as the HTTP dialects (DELIVERED/EMPTY/
+    REMOTE_ERROR/UNREACHABLE) so downstream code (judge, panel counting,
+    preflight reporting) doesn't need to know this call never touched the network.
+    """
+    started = time.time()
+    prompt = wire.body.get("prompt", "")
+    model = wire.body.get("model") or None
+    cmd = ["codex", "exec"]
+    if model:
+        cmd += ["-m", model]
+    cmd += [prompt]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=wire.timeout)
+    except subprocess.TimeoutExpired:
+        return Reply(UNREACHABLE, stage="transport", detail="codex exec timed out",
+                     elapsed=time.time() - started)
+    except FileNotFoundError:
+        return Reply(UNCONFIGURED, stage="config", detail="codex CLI not on PATH",
+                     elapsed=time.time() - started)
+    except Exception as exc:
+        return Reply(UNREACHABLE, stage="transport",
+                     detail=f"{type(exc).__name__}: {exc}"[:200],
+                     elapsed=time.time() - started)
+    elapsed = time.time() - started
+    if proc.returncode != 0:
+        return Reply(REMOTE_ERROR, stage="request", detail=(proc.stderr or "")[:200],
+                     elapsed=elapsed)
+    text = proc.stdout.strip()
+    if not text:
+        return Reply(EMPTY, stage="request", detail="codex exec returned no text",
+                     elapsed=elapsed)
+    return Reply(DELIVERED, text=text, elapsed=elapsed)
+
+
 def send(wire: Wire, dialect: Dialect) -> Reply:
     """把请求发出去并按方言解结果。全仓只有这一个地方发 HTTP。
 
     代理走 proxy_contract 的共享决策点，所以检查器和运行时落在同一个出口地址上——这一点
     有 tests/test_proxy_e2e.py 用假代理端到端钉着。
+
+    codex_cli_subprocess 是唯一的例外：它不发 HTTP，proxy_contract 对它没有意义。
     """
+    if dialect.name == CODEX_CLI_SUBPROCESS:
+        return _send_codex_subprocess(wire)
+    if dialect.name == CLAUDE_CLI_SUBPROCESS:
+        return _send_claude_subprocess(wire)
+    if dialect.name == AGY_CLI_SUBPROCESS:
+        return _send_agy_subprocess(wire)
+
     started = time.time()
     kwargs = proxy_contract.effective_kwargs(
         wire.proxy_contract, wire.url, timeout=wire.timeout)
@@ -550,12 +741,25 @@ def usable_candidates(config: dict[str, Any], role: str,
     allowed = (config.get("roles", {}).get(role) or {}).get("_requires_api")
     if isinstance(allowed, str):
         allowed = [allowed]
+    # Local patch (Hamuy, 2026-09-12): the "agent" role is never called over HTTP by
+    # this repo -- render_env.py projects its model straight into
+    # ar-runtime/.claude/settings.local.json, and the actual auth is whatever Claude
+    # Code CLI is already logged into (subscription OAuth, no API key). The generic
+    # credential probe below only knows how to check ANTHROPIC_BASE_URL/API_KEY/
+    # AUTH_TOKEN, which stays permanently unset here on purpose, so it always reported
+    # this role as unusable even though the real runtime path works fine. Opt-in via
+    # AUTORESEARCH_AGENT_SUBSCRIPTION=1 so this only fires for operators who deliberately
+    # chose subscription-mode agent auth instead of a real Anthropic API key.
+    subscription_mode = (env or os.environ).get("AUTORESEARCH_AGENT_SUBSCRIPTION") == "1"
     ready = []
     for name in role_candidates(config, role):
         profile = profiles.get(name)
         if profile is None or profile.get("api") not in DIALECTS:
             continue
         if allowed and profile.get("api") not in allowed:
+            continue
+        if role == "agent" and subscription_mode:
+            ready.append(name)
             continue
         if unmet_requirements(profile, env):
             continue

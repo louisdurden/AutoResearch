@@ -18,6 +18,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -593,6 +594,65 @@ def next_unit(queue: dict[str, Any]) -> dict[str, Any] | None:
 
 def lock_path(project_root: Path) -> Path:
     return project_root / "workflow_queue.lock"
+
+
+def coordinator_lock_path(project_root: Path) -> Path:
+    return project_root / ".coordinator.lock"
+
+
+# TTL for a coordinator session lock. Normal Ralph-loop resumption always exits the previous
+# process before the Stop hook launches the next one, so the liveness check (os.kill(pid, 0))
+# is what actually distinguishes "previous round already exited, safe to take over" from "another
+# round is genuinely still running right now" -- this TTL only guards against a lock left behind
+# by a process that died without cleaning up (e.g. SIGKILL) on a PID macOS has since recycled.
+COORDINATOR_LOCK_STALE_SECONDS = 3600
+
+
+def acquire_coordinator_lock(project_root: Path) -> None:
+    """Refuse to proceed if another coordinator process is genuinely alive on this project_root.
+
+    2026-09-12 incident: two orphaned `claude -p /ar-coordinator ...` processes from a botched
+    `nohup ... &` relaunch kept running against the same project_root as the real coordinator,
+    all three independently reading state.md/workflow_queue.json and deciding to dispatch their
+    own agents for the same "running" unit. workflow_queue.json's own flock (see queue_lock)
+    serializes writes to that one file, but does nothing to stop three separate processes from
+    each concluding "no agent in flight yet" from their own view of coordinator-session-local
+    state.md and each spawning a duplicate Agent() call. This lock closes that gap one level up,
+    before any unit is claimed.
+    """
+    path = coordinator_lock_path(project_root)
+    own_pid = os.getpid()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            other_pid = int(data.get("pid", -1))
+        except (OSError, ValueError, json.JSONDecodeError):
+            other_pid = -1
+        if other_pid > 0 and other_pid != own_pid:
+            alive = True
+            try:
+                os.kill(other_pid, 0)
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                alive = True  # exists, owned by someone else -- treat as alive
+            if alive:
+                age = time.time() - path.stat().st_mtime
+                if age < COORDINATOR_LOCK_STALE_SECONDS:
+                    print(
+                        f"拒绝启动：coordinator PID {other_pid} 已经在对同一个 "
+                        f"project_root 工作（锁存在 {age:.0f}s，进程存活）。"
+                        "两个协调器同时跑同一个 project_root 会各自往 state.md/decisions.log "
+                        "写重复内容，并各自派发重复的 agent。如果你确定那个 PID 已经不该再管这个"
+                        "项目（比如它是手动 kill 之后残留的僵尸记录），先手动删除 "
+                        f"{path} 再重跑。",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(75)  # EX_TEMPFAIL
+    path.write_text(
+        json.dumps({"pid": own_pid, "acquired_at": now_iso()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 @contextmanager
@@ -2123,6 +2183,7 @@ def recover_unfinished_blind_review(project_root: Path, queue: dict[str, Any]) -
 
 def command_next_prompt(args: argparse.Namespace) -> None:
     project_root = Path(args.project_root).resolve()
+    acquire_coordinator_lock(project_root)
     path = queue_path(project_root)
     queue = load_queue(project_root)
     unit = next_unit(queue)

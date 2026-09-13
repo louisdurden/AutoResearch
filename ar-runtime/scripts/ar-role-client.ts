@@ -84,6 +84,15 @@ function pythonCommand(): string {
   )
 }
 
+// Hard ceiling on the whole bridge call, independent of whatever timeout/retry math is
+// happening inside call_role.py. Without this, a hang anywhere upstream of Python's own
+// subprocess.run(timeout=...) (a stuck stdin read, a deadlocked retry loop, a nested `claude -p`
+// that never returns) blocks this Bun process forever -- observed in production as a single
+// external-critic call sitting in flight for 40+ minutes with zero external timeout to catch it.
+// Set generously above the worst legitimate single-role latency we've measured (~7-8 min for a
+// real review call) so it never kills honest slow work, but still guarantees termination.
+const BRIDGE_HARD_TIMEOUT_MS = 20 * 60 * 1000
+
 async function runBridge(args: string[], input?: unknown): Promise<string> {
   const child = Bun.spawn([pythonCommand(), bridge, ...args], {
     cwd: repoRoot,
@@ -98,11 +107,30 @@ async function runBridge(args: string[], input?: unknown): Promise<string> {
     stdin.write(JSON.stringify(input))
     stdin.end()
   }
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ])
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    child.kill('SIGKILL')
+  }, BRIDGE_HARD_TIMEOUT_MS)
+  let stdout: string
+  let stderr: string
+  let exitCode: number
+  try {
+    ;[stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+  if (timedOut) {
+    throw new RoleBridgeError(
+      stdout,
+      `role bridge killed after exceeding the ${BRIDGE_HARD_TIMEOUT_MS / 1000}s hard ceiling: ${stderr}`,
+      exitCode,
+    )
+  }
   if (exitCode !== 0) {
     throw new RoleBridgeError(stdout, stderr, exitCode)
   }

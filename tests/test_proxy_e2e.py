@@ -381,6 +381,17 @@ def test_a_dead_required_proxy_fails_fast_instead_of_waiting(monkeypatch):
     原来这条按源码字面断言「每个 probe 里出现过 proxy_unreachable」。把发送收敛进
     providers.send 之后那个字面消失了，而行为反而更强：判断只在一处，谁也绕不过去。
     按行为断言，改动实现不会误红，删掉那个判断才会。
+
+    2026-09-12 发现：codex/claude/agy 三个 subprocess 方言（`transport: subprocess`）
+    根本不走代理——它们直接 `subprocess.run(["claude","-p",...])`，从不读
+    `proxy_contract.effective_kwargs` 也不碰 `httpx.Client`。这个循环原来对所有
+    dialect 一视同仁，于是「代理死了」这个前提对它们不成立时，`providers.call` 会
+    绕过上面两个 monkeypatch，真的去 spawn 一个 `claude -p "Reply with exactly: OK"
+    --model m` 子进程——在跑单元测试的时候意外发出真实的、要花钱/花时间的 CLI 调用，
+    因为 "m" 不是一个真模型，退出码非零，落到 REMOTE_ERROR 而不是 UNREACHABLE，断言
+    失败。同一个洞如果留着，任何遍历 DIALECTS 的测试都可能悄悄拿真实订阅去调用一次。
+    显式 mock 掉 subprocess.run 双重兜底，并把这几个方言从「代理不可用」断言里摘出去
+    ——对它们，「有没有代理」本来就是个不适用的前提，不是这条不变式该管的范围。
     """
     import providers
 
@@ -391,7 +402,17 @@ def test_a_dead_required_proxy_fails_fast_instead_of_waiting(monkeypatch):
 
     monkeypatch.setattr(providers.httpx, "Client", explode)
 
+    def explode_subprocess(*a, **kw):
+        raise AssertionError("这条测试只关心代理，不该真的 spawn 一个 CLI 子进程")
+
+    monkeypatch.setattr(providers.subprocess, "run", explode_subprocess)
+
+    subprocess_dialect_names = {
+        "codex_cli_subprocess", "claude_cli_subprocess", "agy_cli_subprocess",
+    }
     for dialect in providers.DIALECTS.values():
+        if dialect.name in subprocess_dialect_names:
+            continue
         reply = providers.call(dialect, {"base_url": "https://x", "api_key": "k"}, "m")
         assert reply.outcome == providers.UNREACHABLE
         assert reply.stage == "transport", f"{dialect.name} 该记成传输层失败"

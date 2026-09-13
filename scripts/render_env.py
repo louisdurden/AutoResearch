@@ -96,8 +96,21 @@ def owned_values(plan: dict[str, dict[str, str]], env: dict[str, str]) -> dict[s
     输出还取决于生成它的代码和当时的环境变量：#185 改了两侧共用的候选判据，配置一个
     字节没动，指纹一样，于是 bringup 报「一致」而文件已经不是现在会写出去的那份（#219）。
     """
+    # Local patch (Hamuy, 2026-09-12): in subscription mode the "agent" role never makes
+    # an HTTP call, so ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN are deliberately absent
+    # from settings.local.json -- Claude Code CLI just uses its own logged-in session.
+    # But Claude Code's own harness injects ANTHROPIC_BASE_URL=https://api.anthropic.com
+    # into every child shell (the managed-env-var allowlist, same mechanism as the
+    # Headroom case in CLAUDE.md), so reading it from `env` here made the projection look
+    # permanently stale against a file that is correctly configured. Drop both keys from
+    # what this run considers "owned" so freshness and materialise agree with the file.
+    subscription_mode = env.get("AUTORESEARCH_AGENT_SUBSCRIPTION") == "1"
+    skip_keys = {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} if subscription_mode else set()
+
     wanted: dict[str, str] = {}
     for key in OWNED:
+        if key in skip_keys:
+            continue
         entry = plan.get(key)
         if entry is None:
             continue
