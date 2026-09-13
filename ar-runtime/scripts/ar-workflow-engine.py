@@ -189,6 +189,25 @@ def critic_path(project_root: Path) -> Path:
     return project_root / "critic.md"
 
 
+def critic_archive_path(project_root: Path, unit_id: str, cycle: int) -> Path:
+    """Immutable per-unit copy of critic.md, written the moment its receipt is
+    recorded. critic.md itself is one shared mutable file reused by every critic
+    dispatch in the project; terminal_critic_receipt_gaps used to be able to
+    re-verify only the LAST completed critic unit against it for exactly that
+    reason (anything written later would silently invalidate every earlier
+    receipt's live-file check). That is a real, reproducible failure mode: any
+    later critic dispatch for ANY reason -- including a legitimate attempt to
+    recover an unrelated stuck unit -- permanently breaks a previously-completed
+    unit's closability once a second one displaces it as "last". Archiving a
+    byte-exact copy at the moment the artifact is verified to belong to this
+    unit (record-critic-receipt already checks that) removes the whole class of
+    bug: every critic unit gets its own immutable evidence, not a shared mutable
+    one repeatedly overwritten by whoever runs next.
+    """
+    safe_unit = re.sub(r"[^A-Za-z0-9_.-]+", "_", unit_id).strip("_") or "unit"
+    return project_root / "critic_archive" / f"{safe_unit}_c{int(cycle)}.md"
+
+
 def blind_review_path(project_root: Path) -> Path:
     return project_root / "blind_review.md"
 
@@ -864,8 +883,8 @@ def read_cycle_report(project_root: Path) -> dict[str, Any]:
     }
 
 
-def read_critic_report(project_root: Path) -> dict[str, Any]:
-    path = critic_path(project_root)
+def read_critic_report(project_root: Path, path: Path | None = None) -> dict[str, Any]:
+    path = path if path is not None else critic_path(project_root)
     text = path.read_text(errors="replace") if path.exists() else ""
     verdict_values = parse_bullet_field(text, "verdict")
     focus = parse_bullet_field(text, "required_next_focus")
@@ -2592,6 +2611,12 @@ def command_record_critic_receipt(args: argparse.Namespace) -> None:
             "missing": gaps,
         }, ensure_ascii=False))
         raise SystemExit(4)
+    # Archive an immutable, unit-scoped copy the moment the shared critic.md is
+    # confirmed to belong to this unit -- before anything else can overwrite it.
+    # See critic_archive_path() for why this exists.
+    archive = critic_archive_path(project_root, unit.get("id"), int(unit.get("cycle", 0) or 0))
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_bytes(artifact.read_bytes())
     event = append_engine_event(
         project_root,
         "critic_receipt",
@@ -3391,9 +3416,25 @@ def terminal_critic_receipt_gaps(project_root: Path, queue: dict[str, Any]) -> l
             gaps.append(f"critic unit {unit.get('id')} 的 receipt cycle 不一致")
         payload_gaps = critic_receipt_payload_gaps(payload, unit)
         gaps.extend(f"critic unit {unit.get('id')}: {gap}" for gap in payload_gaps)
-        # critic.md is intentionally overwritten by later cycles. The ledger preserves
-        # historical bytes; only the latest critic can be rechecked against the live file.
-        if index == len(critics) - 1:
+        # Prefer this unit's own immutable archived copy (written at receipt time,
+        # see critic_archive_path()) so every critic unit -- not just the last one
+        # in list order -- can be independently re-verified regardless of what any
+        # later, unrelated critic dispatch does to the shared critic.md. Units that
+        # completed before this archival fix existed have no archive; for those,
+        # fall back to the old behavior (only the last one gets checked, against
+        # the live shared file) rather than silently skipping verification.
+        archive = critic_archive_path(project_root, unit.get("id"), int(unit.get("cycle", 0) or 0))
+        if archive.is_file():
+            report = read_critic_report(project_root, path=archive)
+            unit_gaps, live = critic_receipt_evidence(
+                project_root,
+                unit,
+                archive,
+                report,
+            )
+            gaps.extend(f"{unit.get('id')}: {gap}" for gap in unit_gaps)
+            current = live
+        elif index == len(critics) - 1:
             report = read_critic_report(project_root)
             artifact = critic_path(project_root)
             unit_gaps, live = critic_receipt_evidence(
@@ -3731,6 +3772,105 @@ def command_skip_cycle(args: argparse.Namespace) -> None:
                       "counts": queue_counts(queue)}, ensure_ascii=False))
 
 
+def command_supersede_critic(args: argparse.Namespace) -> None:
+    """把一个因跨链 cycle 竞态而永久卡死的 critic 单元标记终态。
+
+    2026-09-13 真实事故：next_unit() 的串行单指针视图短暂看不到某条链上仍在飞行的
+    critic 单元时，反绕过逻辑（见 command_next_prompt 里那段注释）曾经把一个早该
+    结束的 pilot 阶段单元当成"最后一个分析"强插了一次盲审，那次修订把项目全局共享
+    的 current_cycle 计数器往前推了一格——而这条 non-pilot 链自己的 critic 单元
+    当时仍持着旧的 cycle 号飞在半空，回来时被 after-critic 的过期门（
+    `stage != "pilot" and source_cycle != current_cycle`）永久拒收：cycle 只会前
+    进，这道门永远不会重新打开；skip-cycle 明确拒绝 cycle 0（"主线不能跳"，by
+    design）；complete 对 critic 类型单元强制走 adjudication（不接受直接
+    done/skipped）。三条路都走不通，之前需要 owner 手动介入。
+
+    根因已经在 command_next_prompt 里修了（反绕过逻辑现在会先确认队列里没有其它
+    未完成的 non-pilot 单元，才会强插盲审），所以这不会再发生在新单元身上。这个
+    命令只处理已经卡死的历史单元：它不是绕过 after-critic 的过期检查，而是承认
+    "这道检查本身设计上就不会再放行这个单元"，把它转成一个显式的、写进同一条哈希
+    链的终态声明——跟 after-critic 会拒绝的原因完全一样透明地记录下来，而不是悄悄
+    改成 done 或跳过检查。
+
+    前置条件，缺一不可：
+      1. 单元类型必须是 critic，状态必须是 running 或 blocked（已经是终态的不碰）。
+      2. 单元自己的 stage 不是 pilot（pilot 本来就不受这道门管，用不上这个命令）。
+      3. 单元的 cycle 号真的落后于队列当前的 current_cycle——这正是 after-critic
+         会拒绝的同一个条件，这里独立重新判一次，不采信调用者的说法。
+      4. critic.md 眼下必须正确绑定着这个单元（unit/cycle 字段吻合），且能解析出
+         一个合法 verdict——证明卡住的是引擎记账，不是内容本身有问题。
+    """
+    project_root = Path(args.project_root).resolve()
+    with queue_lock(project_root):
+        queue = load_queue(project_root)
+        units = unit_by_id(queue)
+        unit = units.get(args.unit)
+        if unit is None or unit.get("type") != "critic":
+            print(json.dumps({"status": "rejected", "reason": "unknown_critic_unit",
+                              "unit": args.unit}, ensure_ascii=False))
+            raise SystemExit(6)
+        if unit.get("status") not in {"running", "blocked"}:
+            print(json.dumps({"status": "rejected", "reason": "not_supersedable_status",
+                              "unit": unit["id"], "current_status": unit.get("status")},
+                              ensure_ascii=False))
+            raise SystemExit(6)
+        if unit.get("stage") == "pilot":
+            print(json.dumps({"status": "rejected", "reason": "pilot_stage_not_gated",
+                              "unit": unit["id"]}, ensure_ascii=False))
+            raise SystemExit(6)
+        source_cycle = int(unit.get("cycle", 0) or 0)
+        current_cycle = int(queue.get("current_cycle", 0) or 0)
+        if source_cycle == current_cycle:
+            print(json.dumps({"status": "rejected", "reason": "not_cycle_mismatch_case",
+                              "unit": unit["id"], "source_cycle": source_cycle,
+                              "current_cycle": current_cycle}, ensure_ascii=False))
+            raise SystemExit(6)
+        critic_file = critic_path(project_root)
+        if not critic_file.is_file() or not artifact_belongs_to(critic_file, unit):
+            print(json.dumps({"status": "rejected", "reason": "critic_artifact_not_bound_to_unit",
+                              "unit": unit["id"]}, ensure_ascii=False))
+            raise SystemExit(6)
+        report = read_critic_report(project_root)
+        report_cycle = report.get("cycle")
+        if report.get("unit") != unit.get("id") or report_cycle is None or int(report_cycle) != source_cycle:
+            print(json.dumps({"status": "rejected", "reason": "critic_report_fields_mismatch",
+                              "unit": unit["id"]}, ensure_ascii=False))
+            raise SystemExit(6)
+        verdict = str(report.get("verdict") or "").strip().lower()
+        if verdict not in {"finish_ok", "needs_revision", "needs_more_research"}:
+            print(json.dumps({"status": "rejected", "reason": "critic_verdict_unparseable",
+                              "unit": unit["id"], "verdict": report.get("verdict")},
+                              ensure_ascii=False))
+            raise SystemExit(6)
+        unit["status"] = "skipped"
+        unit["ended_at"] = now_iso()
+        drop_claim(unit)
+        unit["result"] = (
+            f"superseded: cycle {source_cycle} could not advance because current_cycle had "
+            f"already moved to {current_cycle} via an unrelated chain before this unit's own "
+            f"critic ever resolved (root cause fixed in command_next_prompt; this unit predates "
+            f"the fix). No normal completion path exists for a non-pilot critic unit whose cycle "
+            f"has been overtaken this way. Bound content verdict={verdict}, recorded for the "
+            f"historical record only -- not treated as this project's operative decision, since "
+            f"that already came from whichever unit(s) actually completed in the active chain."
+        )
+        queue["iteration"] = int(queue.get("iteration", 0) or 0) + 1
+        write_queue(project_root, queue)
+        record_terminal_unit(project_root, unit, "supersede-critic", {
+            "verdict": verdict,
+            "source_cycle": source_cycle,
+            "current_cycle_at_supersede": current_cycle,
+        })
+        append_decision(
+            project_root,
+            f"event=critic_superseded unit={unit['id']} source_cycle={source_cycle} "
+            f"current_cycle={current_cycle} verdict={verdict} "
+            f"reason=cross_chain_cycle_race_fixed_in_command_next_prompt_this_unit_predates_it",
+        )
+    print(json.dumps({"status": "ok", "outcome": "superseded", "unit": unit["id"],
+                      "counts": queue_counts(queue)}, ensure_ascii=False))
+
+
 def command_verify_close(args: argparse.Namespace) -> None:
     """只读复核：这个项目算不算真的收尾了。
 
@@ -3855,6 +3995,13 @@ def build_parser() -> argparse.ArgumentParser:
     skip_cycle.add_argument("--cycle", required=True, type=int)
     skip_cycle.add_argument("--worker", default="", help="Recorded in the decision log only")
     skip_cycle.set_defaults(func=command_skip_cycle)
+
+    supersede_critic = subparsers.add_parser(
+        "supersede-critic",
+        help="Terminal-mark a non-pilot critic unit permanently stuck on a cross-chain cycle race")
+    supersede_critic.add_argument("--project-root", required=True)
+    supersede_critic.add_argument("--unit", required=True)
+    supersede_critic.set_defaults(func=command_supersede_critic)
 
     claim = subparsers.add_parser("claim", help="Self-organizing: atomically claim one ready unit with a lease")
     claim.add_argument("--project-root", required=True)

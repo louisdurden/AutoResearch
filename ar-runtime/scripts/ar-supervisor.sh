@@ -324,9 +324,28 @@ for attempt in $(seq 1 "$MAX_RESTARTS"); do
   # 显式带上 project_root：is_done/manifest 盯的就是 $PROJ，不能靠 coordinator 重新推导。
   # attempt 放后台、用可中断的 wait 等：bash 在前台命令期间会推迟 trap，SIGTERM 要等
   # 6h attempt 跑完才生效——实测中断后 monitor 存活的根源。
+  #
+  # 2026-09-13 实测发现：每次 attempt 都是全新进程，之前 Agent 工具派发的
+  # planner/coder/reviewer 子代理在旧进程退出时必死（ListAgents 在新会话里看不到
+  # 它们），逼得 coordinator 每轮都重新从 state.md/decisions.log 重建上下文再重新
+  # 派发一个全新子代理，而不是接着已有对话继续。Ralph Loop 插件自带的 Stop hook
+  # 本来是干这个的，但那个机制靠的是"拦截会话退出、原地续喂"，只对交互式会话有效——
+  # `-p` print 模式的会话设计上就是跑完一轮就退出，没有可拦截的退出点，所以
+  # `.claude/ralph-loop.local.md` 每轮建了又"消失"其实是这条路径根本没生效，不是
+  # 文件被谁删了。真正能续上下文的是 CLI 自己的 `-c/--continue`（"继续当前目录最近
+  # 一次对话"），经空目录实测验证：跨两个完全独立的 `claude -p` 进程，第二个用 -c
+  # 真的记得第一个说过的内容。第一次 attempt 仍需要完整的 `/ar-coordinator` 提示来
+  # 走 Phase 0 初始化；attempt>1 改用 -c 续上一次的会话，coordinator 不用每轮都从零
+  # 重建"上一轮做了什么"，子代理这类进程内状态虽然还是救不回来，但至少不用每轮都
+  # 重新读文件、重新推理出同样的结论。
   ATTEMPT_PGID_FILE="$(mktemp "${TMPDIR:-/tmp}/ar-supervisor-attempt.XXXXXX")"
-  run_with_timeout "$CLAUDE_BIN" --dangerously-skip-permissions --model "$CLAUDE_MODEL" \
-    -p "/ar-coordinator $IDEA $PROJ" &
+  if [ "$attempt" -eq 1 ]; then
+    run_with_timeout "$CLAUDE_BIN" --dangerously-skip-permissions --model "$CLAUDE_MODEL" \
+      -p "/ar-coordinator $IDEA $PROJ" &
+  else
+    run_with_timeout "$CLAUDE_BIN" --dangerously-skip-permissions --model "$CLAUDE_MODEL" \
+      -c -p "/ar-coordinator $IDEA $PROJ" &
+  fi
   ATTEMPT_PID=$!
   wait "$ATTEMPT_PID"
   rc=$?
