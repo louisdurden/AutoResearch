@@ -12,6 +12,7 @@ ATTEMPT_TIMEOUT="${4:-6h}"
 AR_MAX_CYCLES="${AR_MAX_CYCLES:-3}"
 RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CLAUDE_MODEL="${CLAUDE_MODEL:-sonnet}"
 # Print mode must keep the process group alive until asynchronous agents report
 # back. A finite Claude Code ceiling kills the producer but leaves its unit running.
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
@@ -324,7 +325,7 @@ for attempt in $(seq 1 "$MAX_RESTARTS"); do
   # attempt 放后台、用可中断的 wait 等：bash 在前台命令期间会推迟 trap，SIGTERM 要等
   # 6h attempt 跑完才生效——实测中断后 monitor 存活的根源。
   ATTEMPT_PGID_FILE="$(mktemp "${TMPDIR:-/tmp}/ar-supervisor-attempt.XXXXXX")"
-  run_with_timeout "$CLAUDE_BIN" --dangerously-skip-permissions \
+  run_with_timeout "$CLAUDE_BIN" --dangerously-skip-permissions --model "$CLAUDE_MODEL" \
     -p "/ar-coordinator $IDEA $PROJ" &
   ATTEMPT_PID=$!
   wait "$ATTEMPT_PID"
