@@ -51,12 +51,14 @@ def ready_models(role: str) -> tuple[list[str], list[str], list[str], str]:
         profile = profiles.get(name)
         if not profile or profile.get("api") not in providers.DIALECTS:
             continue
-        key = "auth_token" if profile.get("api") == "anthropic_messages" else "api_key"
-        required = profile.get("requires_env") or {}
-        if (providers.resolve(profile, "base_url")
-                and (providers.resolve(profile, key) or providers.resolve(profile, "api_key"))
-                and all(os.environ.get(env_name) == wanted
-                        for env_name, wanted in required.items())):
+        # 2026-09-13 发现：这里原来自己判 base_url+api_key，把 subprocess 方言
+        # （claude-sub/codex-sub/agy-sub）一律判成没配——它们根本不用 base_url/api_key，
+        # 一次真实调用几秒钟就能成功。结果 critic role 的 self-test 报 claude-sub 不可用，
+        # coordinator 据此得出「独立评审对子退化成同一个模型」的错误诊断，而真实故障在
+        # 别处（本机 Qwen 没关 enable_thinking，答案吐在隐式思考里）。改用
+        # providers.unmet_requirements——同一份判断，preflight/运行时/这里三处共用，
+        # 「能用」不会在这第三处又长出一份自己的定义。
+        if not providers.unmet_requirements(profile):
             ready.append(name)
     identities = list(dict.fromkeys(
         providers.model_identity(config, model) for model in ready

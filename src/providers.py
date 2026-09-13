@@ -189,6 +189,12 @@ class OpenAIChat:
                     "reasoning_effort must be one of: none, low, medium, high"
                 )
             body["reasoning_effort"] = reasoning_effort
+        if "chat_template_kwargs" in params:
+            # Qwen（本机 oMLX 走的这条路）默认把推理预算先花在看不见的 thinking
+            # 上：HTTP 200、形状对、message.content 是空串，上面 read() 早就写了这条
+            # 注释但从没人把开关递过去。这是唯一关掉它的办法——Anthropic 端点不认这个
+            # 键，所以只在这个 OpenAI 兼容方言里加，不动 AnthropicMessages。
+            body["chat_template_kwargs"] = params["chat_template_kwargs"]
         return Wire(
             method="POST", url=self.url(endpoint["base_url"], params.get("url_style", "mcp")),
             body=body,
