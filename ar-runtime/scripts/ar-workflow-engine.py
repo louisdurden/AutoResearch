@@ -2204,6 +2204,24 @@ def command_next_prompt(args: argparse.Namespace) -> None:
             return
         # 反绕过：没有任何盲审单元跑完就想收尾（例如假设证伪后大批 skip 直接 close），
         # 强制补插一个盲审——负结果也要冷启动打分，这正是挤水分机制存在的意义。
+        #
+        # 2026-09-13 发现的真实事故：next_unit() 是串行单指针视图，只看队列里第一个
+        # ACTIVE_STATUSES 的单元。coordinator 用 `claim`/`ready` 自组织并行推进 main
+        # 链的时候，main 链当时那个单元可能恰好处于串行视图看不见的瞬时状态（例如刚被
+        # 标 blocked 又还没重新排队），next_unit() 于是在这一刻返回 None，而这段反绕过
+        # 逻辑就把 pilot 阶段一个早就该结束、早就存在的 terminal 单元当成"最后一个分析"
+        # 强行插了一次盲审。那次盲审评分低，触发了修订轮，修订轮又把 current_cycle 这个
+        # 项目全局共享的计数器往前推了一格——而 main 链那个仍在飞行中的 critic 单元用的
+        # 是旧的 cycle 号，回来时 after-critic 判它 stale，永久卡死，close 从此不可达。
+        # 根因是「pilot 阶段还有真实内容没跑完」被漏判成了「项目已经空转」。这里补一道
+        # 检查：只要队列里还有任何非 pilot 阶段、状态不是终态的单元，就说明项目其实没
+        # 排空，只是这一刻的串行视图恰好卡在中间——这一轮什么都不做，比强插一次可能语义
+        # 错位的盲审更安全，下一轮 next-prompt/claim 自然会继续推进真正该跑的单元。
+        main_chain_unfinished = any(
+            u.get("stage") not in ("pilot", None)
+            and u.get("status") not in TERMINAL_STATUSES
+            for u in queue.get("units", [])
+        )
         has_blind_done = any(
             u.get("type") == "blind-review" and u.get("status") in TERMINAL_STATUSES
             for u in queue.get("units", [])
@@ -2213,7 +2231,7 @@ def command_next_prompt(args: argparse.Namespace) -> None:
             for u in queue.get("units", [])
             if u.get("type") in ("result-analysis", "critic") and u.get("status") == "done"
         ]
-        if not has_blind_done and terminal_analysis:
+        if not has_blind_done and terminal_analysis and not main_chain_unfinished:
             blind_id = append_blind_review(queue, terminal_analysis[-1])
             if blind_id:
                 write_queue(project_root, queue)
